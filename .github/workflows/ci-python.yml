@@ -1,0 +1,39 @@
+name: Python tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.12", "3.13"]
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Compile Python sources
+        run: python -m compileall -q scripts tests
+
+      - name: Run offline unit tests
+        run: python -m unittest discover -s tests -v
+
+      - name: Check command help
+        run: |
+          python scripts/china_edu_book.py --help
+          python scripts/china_edu_book.py search --help
+          python scripts/china_edu_book.py download --help
