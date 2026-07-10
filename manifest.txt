@@ -1,0 +1,13 @@
+.github/workflows/test.yml
+.gitignore
+CHANGELOG.md
+LICENSE
+README.md
+SKILL.md
+THIRD_PARTY_NOTICES.md
+manifest.txt
+references/platform.md
+references/troubleshooting.md
+scripts/__init__.py
+scripts/china_edu_book.py
+tests/test_china_edu_book.py
