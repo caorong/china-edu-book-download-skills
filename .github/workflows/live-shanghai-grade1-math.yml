@@ -1,0 +1,179 @@
+name: Live Shanghai grade 1 math textbook test
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  live-download:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Compile and run offline tests
+        run: |
+          python -m compileall -q scripts tests
+          python -m unittest discover -s tests -v
+
+      - name: Check SmartEdu public index
+        run: |
+          python scripts/china_edu_book.py doctor --network --json | tee /tmp/doctor.json
+
+      - name: Search Shanghai grade-one math textbooks
+        run: |
+          python scripts/china_edu_book.py search \
+            --stage 小学 \
+            --grade 一年级 \
+            --subject 数学 \
+            --version 沪教版 \
+            --refresh \
+            --limit 50 \
+            --json > /tmp/search.json
+          python - <<'PY'
+          import json
+          from pathlib import Path
+
+          payload = json.loads(Path('/tmp/search.json').read_text(encoding='utf-8'))
+          candidates = payload.get('candidates') or []
+          if not candidates:
+              raise SystemExit('No Shanghai grade-one math textbook candidate was found')
+
+          preferred_markers = ('上册', '第一学期', '第一册')
+          selected = next(
+              (
+                  item for item in candidates
+                  if any(marker in str(item.get('volume') or item.get('title') or '') for marker in preferred_markers)
+              ),
+              candidates[0],
+          )
+          resource_id = selected.get('resource_id')
+          if not resource_id:
+              raise SystemExit('Selected candidate has no resource_id')
+
+          summary = {
+              'query': {
+                  'stage': '小学',
+                  'grade': '一年级',
+                  'subject': '数学',
+                  'version': '沪教版',
+              },
+              'matched': payload.get('matched'),
+              'candidates': [
+                  {
+                      'resource_id': item.get('resource_id'),
+                      'title': item.get('title'),
+                      'stage': item.get('stage'),
+                      'grade': item.get('grade'),
+                      'subject': item.get('subject'),
+                      'version': item.get('version'),
+                      'volume': item.get('volume'),
+                      'provider': item.get('provider'),
+                      'source_url': item.get('source_url'),
+                  }
+                  for item in candidates
+              ],
+              'selected': {
+                  'resource_id': resource_id,
+                  'title': selected.get('title'),
+                  'version': selected.get('version'),
+                  'volume': selected.get('volume'),
+                  'source_url': selected.get('source_url'),
+              },
+          }
+          Path('/tmp/search-summary.json').write_text(
+              json.dumps(summary, ensure_ascii=False, indent=2),
+              encoding='utf-8',
+          )
+          with open(Path(__import__('os').environ['GITHUB_OUTPUT']), 'a', encoding='utf-8') as output:
+              output.write(f"resource_id={resource_id}\n")
+          print(json.dumps(summary, ensure_ascii=False, indent=2))
+          PY
+        id: select
+
+      - name: Download one selected textbook
+        run: |
+          python scripts/china_edu_book.py download \
+            --id "${{ steps.select.outputs.resource_id }}" \
+            --output-dir /tmp/shanghai-grade1-math \
+            --flat \
+            --workers 1 \
+            --json > /tmp/download.json
+
+      - name: Validate downloaded PDF and remove it
+        run: |
+          python - <<'PY'
+          import hashlib
+          import json
+          import shutil
+          from pathlib import Path
+
+          payload = json.loads(Path('/tmp/download.json').read_text(encoding='utf-8'))
+          files = payload.get('files') or []
+          if payload.get('failed') != 0 or len(files) != 1 or not files[0].get('ok'):
+              raise SystemExit(f'Download failed: {json.dumps(payload, ensure_ascii=False)}')
+
+          item = files[0]
+          path = Path(item['path'])
+          if not path.is_file():
+              raise SystemExit(f'Downloaded file does not exist: {path}')
+          data_prefix = path.read_bytes()[:5]
+          if data_prefix != b'%PDF-':
+              raise SystemExit(f'Invalid PDF signature: {data_prefix!r}')
+          size = path.stat().st_size
+          if size < 10_000:
+              raise SystemExit(f'PDF is unexpectedly small: {size} bytes')
+
+          digest = hashlib.sha256()
+          with path.open('rb') as handle:
+              for chunk in iter(lambda: handle.read(1024 * 1024), b''):
+                  digest.update(chunk)
+          sha256 = digest.hexdigest()
+          if sha256 != item.get('sha256'):
+              raise SystemExit('SHA-256 reported by the skill does not match the downloaded file')
+
+          search = json.loads(Path('/tmp/search-summary.json').read_text(encoding='utf-8'))
+          report = {
+              'result': 'passed',
+              'search': search,
+              'download': {
+                  'resource_id': item.get('resource_id'),
+                  'title': item.get('title'),
+                  'size': size,
+                  'sha256': sha256,
+                  'pdf_signature': '%PDF-',
+                  'auth_configured': payload.get('auth_configured'),
+              },
+          }
+          Path('/tmp/live-test-report.json').write_text(
+              json.dumps(report, ensure_ascii=False, indent=2),
+              encoding='utf-8',
+          )
+          print(json.dumps(report, ensure_ascii=False, indent=2))
+
+          shutil.rmtree('/tmp/shanghai-grade1-math', ignore_errors=True)
+          if path.exists():
+              raise SystemExit('Downloaded PDF was not removed after validation')
+          PY
+
+      - name: Upload test report only
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: shanghai-grade1-math-live-test-report
+          path: |
+            /tmp/doctor.json
+            /tmp/search-summary.json
+            /tmp/live-test-report.json
+          if-no-files-found: warn
+          retention-days: 1
