@@ -42,6 +42,7 @@ jobs:
             --json > /tmp/search.json
           python - <<'PY'
           import json
+          import os
           from pathlib import Path
 
           payload = json.loads(Path('/tmp/search.json').read_text(encoding='utf-8'))
@@ -95,22 +96,39 @@ jobs:
               json.dumps(summary, ensure_ascii=False, indent=2),
               encoding='utf-8',
           )
-          with open(Path(__import__('os').environ['GITHUB_OUTPUT']), 'a', encoding='utf-8') as output:
+          with open(os.environ['GITHUB_OUTPUT'], 'a', encoding='utf-8') as output:
               output.write(f"resource_id={resource_id}\n")
           print(json.dumps(summary, ensure_ascii=False, indent=2))
           PY
         id: select
 
       - name: Download one selected textbook
+        id: download
+        continue-on-error: true
         run: |
+          set +e
           python scripts/china_edu_book.py download \
             --id "${{ steps.select.outputs.resource_id }}" \
             --output-dir /tmp/shanghai-grade1-math \
             --flat \
             --workers 1 \
-            --json > /tmp/download.json
+            --json > /tmp/download.json 2> /tmp/download.stderr
+          status=$?
+          set -e
+          printf '%s\n' "$status" > /tmp/download-exit-code.txt
+          echo "download exit code: $status"
+          if [ -s /tmp/download.stderr ]; then
+            echo '--- download stderr ---'
+            cat /tmp/download.stderr
+          fi
+          if [ -s /tmp/download.json ]; then
+            echo '--- download stdout ---'
+            cat /tmp/download.json
+          fi
+          exit "$status"
 
       - name: Validate downloaded PDF and remove it
+        if: always()
         run: |
           python - <<'PY'
           import hashlib
@@ -118,10 +136,49 @@ jobs:
           import shutil
           from pathlib import Path
 
-          payload = json.loads(Path('/tmp/download.json').read_text(encoding='utf-8'))
+          exit_code_path = Path('/tmp/download-exit-code.txt')
+          exit_code = int(exit_code_path.read_text().strip()) if exit_code_path.exists() else 999
+          stdout_path = Path('/tmp/download.json')
+          stderr_path = Path('/tmp/download.stderr')
+          stderr = stderr_path.read_text(encoding='utf-8', errors='replace') if stderr_path.exists() else ''
+
+          search = json.loads(Path('/tmp/search-summary.json').read_text(encoding='utf-8'))
+          if exit_code != 0 or not stdout_path.exists() or not stdout_path.read_text(encoding='utf-8').strip():
+              report = {
+                  'result': 'failed',
+                  'search': search,
+                  'download': {
+                      'exit_code': exit_code,
+                      'stderr': stderr[-12000:],
+                  },
+              }
+              Path('/tmp/live-test-report.json').write_text(
+                  json.dumps(report, ensure_ascii=False, indent=2),
+                  encoding='utf-8',
+              )
+              print(json.dumps(report, ensure_ascii=False, indent=2))
+              shutil.rmtree('/tmp/shanghai-grade1-math', ignore_errors=True)
+              raise SystemExit('The skill download command failed; see live-test-report.json')
+
+          payload = json.loads(stdout_path.read_text(encoding='utf-8'))
           files = payload.get('files') or []
           if payload.get('failed') != 0 or len(files) != 1 or not files[0].get('ok'):
-              raise SystemExit(f'Download failed: {json.dumps(payload, ensure_ascii=False)}')
+              report = {
+                  'result': 'failed',
+                  'search': search,
+                  'download': {
+                      'exit_code': exit_code,
+                      'payload': payload,
+                      'stderr': stderr[-12000:],
+                  },
+              }
+              Path('/tmp/live-test-report.json').write_text(
+                  json.dumps(report, ensure_ascii=False, indent=2),
+                  encoding='utf-8',
+              )
+              print(json.dumps(report, ensure_ascii=False, indent=2))
+              shutil.rmtree('/tmp/shanghai-grade1-math', ignore_errors=True)
+              raise SystemExit('The skill reported a failed download; see live-test-report.json')
 
           item = files[0]
           path = Path(item['path'])
@@ -142,7 +199,6 @@ jobs:
           if sha256 != item.get('sha256'):
               raise SystemExit('SHA-256 reported by the skill does not match the downloaded file')
 
-          search = json.loads(Path('/tmp/search-summary.json').read_text(encoding='utf-8'))
           report = {
               'result': 'passed',
               'search': search,
@@ -174,6 +230,9 @@ jobs:
           path: |
             /tmp/doctor.json
             /tmp/search-summary.json
+            /tmp/download.json
+            /tmp/download.stderr
+            /tmp/download-exit-code.txt
             /tmp/live-test-report.json
           if-no-files-found: warn
           retention-days: 1
